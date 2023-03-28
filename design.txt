@@ -1,0 +1,43 @@
+ResizableSemaphore
+	记录function的空闲容器数和容器总数
+	获取 idle-- 不能为负
+	释放 idle++
+	创建 count++
+	删除 idle-- count--
+
+NestedSemaphore
+	记录invoker的空闲内存和总内存，以及ResizableSemaphore表
+	获取 total--
+	释放 total++
+	创建 free-- total--
+	删除 free++
+
+	       idle    count    free    total
+	获取    -                        -
+	释放    +                        +
+	创建            +        -       -
+	删除    -       -        +
+
+ShardingContainerPoolBalancer
+	处理容器删除反馈，以及节点选择
+	优先选有空闲容器的节点
+		找一个总内存够的节点做最坏打算
+		找空闲内存够，容器总数最多的节点
+	次选空闲内存够的节点
+	再次总内存够的节点
+	最后过载选随机节点
+
+InvokerReactive
+	传递producer参数
+
+ContainerProxy
+	处理请求与伪请求，以及标记冷启动
+	未初始化     初始化并处理请求，仅初始化伪请求
+	prewarm完成 初始化并处理请求，仅初始化伪请求
+	正在初始化/运行 （接受请求入队，接受伪请求忽略）接受删除信号则删除
+	就绪/挂起    接受删除信号则删除
+
+ContainerPool
+	选择容器，报告容器删除
+	找到热容器传递请求（热启动）；冷容器传递伪请求，请求入队
+	容器处理完请求/伪请求，先尝试唤醒一个队列中请求进行容器交换（可能冷启动）

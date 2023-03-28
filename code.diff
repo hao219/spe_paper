@@ -1,0 +1,1073 @@
+diff --git a/common/scala/Dockerfile b/common/scala/Dockerfile
+index 6aa96372..a6687019 100644
+--- a/common/scala/Dockerfile
++++ b/common/scala/Dockerfile
+@@ -22,7 +22,7 @@ ENV LANGUAGE en_US:en
+ ENV LC_ALL en_US.UTF-8
+ 
+ # Switch to the HTTPS endpoint for the apk repositories as per https://github.com/gliderlabs/docker-alpine/issues/184
+-RUN sed -i 's/http\:\/\/dl-cdn.alpinelinux.org/https\:\/\/alpine.global.ssl.fastly.net/g' /etc/apk/repositories
++#RUN sed -i 's/http\:\/\/dl-cdn.alpinelinux.org/https\:\/\/alpine.global.ssl.fastly.net/g' /etc/apk/repositories
+ RUN apk add --update sed curl bash && apk update && apk upgrade
+ 
+ RUN mkdir /logs
+diff --git a/common/scala/src/main/scala/org/apache/openwhisk/common/NestedSemaphore.scala b/common/scala/src/main/scala/org/apache/openwhisk/common/NestedSemaphore.scala
+index 4a6942b3..8401baf7 100644
+--- a/common/scala/src/main/scala/org/apache/openwhisk/common/NestedSemaphore.scala
++++ b/common/scala/src/main/scala/org/apache/openwhisk/common/NestedSemaphore.scala
+@@ -29,13 +29,12 @@ import scala.collection.concurrent.TrieMap
+ class NestedSemaphore[T](memoryPermits: Int) extends ForcibleSemaphore(memoryPermits) {
+   private val actionConcurrentSlotsMap = TrieMap.empty[T, ResizableSemaphore] //one key per action; resized per container
+ 
+-  final def tryAcquireConcurrent(actionid: T, maxConcurrent: Int, memoryPermits: Int): Boolean = {
++  /** 总内存 */
++  private val total = new ForcibleSemaphore(memoryPermits)
+ 
+-    if (maxConcurrent == 1) {
+-      super.tryAcquire(memoryPermits)
+-    } else {
+-      tryOrForceAcquireConcurrent(actionid, maxConcurrent, memoryPermits, false)
+-    }
++  /** Try to acquire an idle container of the action */
++  final def tryAcquireConcurrent(actionid: T, maxConcurrent: Int, memoryPermits: Int): (Boolean, Boolean, Int, Int, Int) = {
++    tryOrForceAcquireConcurrent(actionid, maxConcurrent, memoryPermits, false)
+   }
+ 
+   /**
+@@ -54,40 +53,47 @@ class NestedSemaphore[T](memoryPermits: Int) extends ForcibleSemaphore(memoryPer
+    * @param force
+    * @return
+    */
++   /** 返回值：拿到空闲容器，空闲内存够，容器总数，空闲内存，总内存 */
+   private def tryOrForceAcquireConcurrent(actionid: T,
+                                           maxConcurrent: Int,
+                                           memoryPermits: Int,
+-                                          force: Boolean): Boolean = {
++                                          force: Boolean): (Boolean, Boolean, Int, Int, Int) = {
+     val concurrentSlots = actionConcurrentSlotsMap
+       .getOrElseUpdate(actionid, new ResizableSemaphore(0, maxConcurrent))
+     if (concurrentSlots.tryAcquire(1)) {
+-      true
++      /** 获取一个空闲容器 total-- */
++      total.forceAcquire(memoryPermits)
++      (true, true, concurrentSlots.counter, super.availablePermits, total.availablePermits)
+     } else {
+       // with synchronized:
+       concurrentSlots.synchronized {
+         if (concurrentSlots.tryAcquire(1)) {
+-          true
++          /** 获取一个空闲容器 total-- */
++          total.forceAcquire(memoryPermits)
++          (true, true, concurrentSlots.counter, super.availablePermits, total.availablePermits)
+         } else if (force) {
++          /** 创建一个忙容器 total--
++           *      free够，free--
++           *      free不够，应该是不变的，先free--，然后会返回一个删除事件，free++
++           */
+           super.forceAcquire(memoryPermits)
+-          concurrentSlots.release(maxConcurrent - 1, false)
+-          true
++          total.forceAcquire(memoryPermits)
++          concurrentSlots.create()
++          (false, true, concurrentSlots.counter, super.availablePermits, total.availablePermits)
+         } else if (super.tryAcquire(memoryPermits)) {
+-          concurrentSlots.release(maxConcurrent - 1, false)
+-          true
++          super.release(memoryPermits)
++          (false, true, concurrentSlots.counter, super.availablePermits, total.availablePermits)
+         } else {
+-          false
++          (false, false, concurrentSlots.counter, super.availablePermits, total.availablePermits)
+         }
+       }
+     }
+   }
+ 
++  /** Acquire an idle container to allocate memory for a cold container  */
+   def forceAcquireConcurrent(actionid: T, maxConcurrent: Int, memoryPermits: Int): Unit = {
+     require(memoryPermits > 0, "cannot force acquire negative or no permits")
+-    if (maxConcurrent == 1) {
+-      super.forceAcquire(memoryPermits)
+-    } else {
+-      tryOrForceAcquireConcurrent(actionid, maxConcurrent, memoryPermits, true)
+-    }
++    tryOrForceAcquireConcurrent(actionid, maxConcurrent, memoryPermits, true)
+   }
+ 
+   /**
+@@ -95,22 +101,30 @@ class NestedSemaphore[T](memoryPermits: Int) extends ForcibleSemaphore(memoryPer
+    *
+    * @param acquires the number of permits to release
+    */
+-  def releaseConcurrent(actionid: T, maxConcurrent: Int, memoryPermits: Int): Unit = {
++   /*** 释放一个空闲容器 total++ */
++  def releaseConcurrent(actionid: T, maxConcurrent: Int, memoryPermits: Int, remove: Boolean = false): Unit = {
+     require(memoryPermits > 0, "cannot release negative or no permits")
+-    if (maxConcurrent == 1) {
+-      super.release(memoryPermits)
+-    } else {
+-      val concurrentSlots = actionConcurrentSlotsMap(actionid)
+-      val (memoryRelease, actionRelease) = concurrentSlots.release(1, true)
+-      //concurrent slots
+-      if (memoryRelease) {
+-        super.release(memoryPermits)
+-      }
+-      if (actionRelease) {
+-        actionConcurrentSlotsMap.remove(actionid)
+-      }
++    total.release(memoryPermits)
++    val concurrentSlots = actionConcurrentSlotsMap(actionid)
++    concurrentSlots.release(1, true)
++  }
++
++   /** 删除一个空闲容器 free++ */
++  def removeConcurrent(actionid: T, maxConcurrent: Int, memoryPermits: Int, count: Int = 1): Unit = {
++    require(memoryPermits > 0, "cannot release negative or no permits")
++    val concurrentSlots = actionConcurrentSlotsMap(actionid)
++    val actionRelease = concurrentSlots.remove(count)
++    if (actionRelease) {
++      actionConcurrentSlotsMap.remove(actionid)
+     }
++    super.release(memoryPermits * count)
+   }
++
++  def getIdles(actionid: T) = actionConcurrentSlotsMap(actionid).sync.permits
++  def getCounter(actionid: T) = actionConcurrentSlotsMap(actionid).counter
++  def getFree = super.availablePermits
++  def getTotal = total.availablePermits
++
+   //for testing
+   def concurrentState = actionConcurrentSlotsMap.readOnlySnapshot()
+ }
+diff --git a/common/scala/src/main/scala/org/apache/openwhisk/common/ResizableSemaphore.scala b/common/scala/src/main/scala/org/apache/openwhisk/common/ResizableSemaphore.scala
+index 814e906a..54e3e67f 100644
+--- a/common/scala/src/main/scala/org/apache/openwhisk/common/ResizableSemaphore.scala
++++ b/common/scala/src/main/scala/org/apache/openwhisk/common/ResizableSemaphore.scala
+@@ -17,7 +17,7 @@
+ 
+ package org.apache.openwhisk.common
+ 
+-import java.util.concurrent.atomic.AtomicInteger
++// import java.util.concurrent.atomic.AtomicInteger
+ import java.util.concurrent.locks.AbstractQueuedSynchronizer
+ import scala.annotation.tailrec
+ 
+@@ -31,26 +31,20 @@ import scala.annotation.tailrec
+  * @param reductionSize
+  */
+ class ResizableSemaphore(maxAllowed: Int, reductionSize: Int) {
+-  private val operationCount = new AtomicInteger(0)
++  // private val containerCount = new AtomicInteger(0)
+   class Sync extends AbstractQueuedSynchronizer {
+     setState(maxAllowed)
+ 
+     def permits: Int = getState
+ 
+     /** Try to release a permit and return whether or not that operation was successful. */
++    /** 释放一个空闲容器 */
+     @tailrec
+-    final def tryReleaseSharedWithResult(releases: Int): Boolean = {
++    final def tryReleaseSharedWithResult(releases: Int): Unit = {
+       val current = getState
+-      val next2 = current + releases
+-      val (next, reduced) = if (next2 % reductionSize == 0) {
+-        (next2 - reductionSize, true)
+-      } else {
+-        (next2, false)
+-      }
++      val next = current + releases
+       //next MIGHT be < current in case of reduction; this is OK!!!
+-      if (compareAndSetState(current, next)) {
+-        reduced
+-      } else {
++      if (!compareAndSetState(current, next)) {
+         tryReleaseSharedWithResult(releases)
+       }
+     }
+@@ -69,9 +63,24 @@ class ResizableSemaphore(maxAllowed: Int, reductionSize: Int) {
+         nonFairTryAcquireShared(acquires)
+       }
+     }
++
++    /** 删除一个空闲容器 */
++    @tailrec
++    final def remove(acquires: Int): Int = {
++      val available = getState
++      val remaining = available - acquires
++      if (!compareAndSetState(available, remaining)) {
++        remove(acquires)
++      } else {
++        remaining
++      }
++    }
+   }
+ 
++  // 空闲容器数
+   val sync = new Sync
++  // 容器总数
++  var containerCount = new Sync
+ 
+   /**
+    * Acquires the given numbers of permits.
+@@ -79,10 +88,10 @@ class ResizableSemaphore(maxAllowed: Int, reductionSize: Int) {
+    * @param acquires the number of permits to get
+    * @return `true`, iff the internal semaphore's number of permits is positive, `false` if negative
+    */
++   /** 尝试获取一个空闲容器 */
+   def tryAcquire(acquires: Int = 1): Boolean = {
+     require(acquires > 0, "cannot acquire negative or no permits")
+     if (sync.nonFairTryAcquireShared(acquires) >= 0) {
+-      operationCount.incrementAndGet()
+       true
+     } else {
+       false
+@@ -96,20 +105,37 @@ class ResizableSemaphore(maxAllowed: Int, reductionSize: Int) {
+    * @return (releaseMemory, releaseAction) releaseMemory is true if concurrency count is a factor of reductionSize
+    *         releaseAction is true if the operationCount reaches 0
+    */
+-  def release(acquires: Int = 1, opComplete: Boolean): (Boolean, Boolean) = {
++   /** 释放一个空闲容器 */
++  def release(acquires: Int = 1, opComplete: Boolean): Unit = {
+     require(acquires > 0, "cannot release negative or no permits")
+-    //release always succeeds, so we can always adjust the operationCount
+-    val releaseAction = if (opComplete) { // an operation completion
+-      operationCount.decrementAndGet() == 0
+-    } else { //otherwise an allocation + operation initialization
+-      operationCount.incrementAndGet() == 0
+-    }
+-    (sync.tryReleaseSharedWithResult(acquires), releaseAction)
++    sync.tryReleaseSharedWithResult(acquires)
++  }
++
++  /** 创建一个忙容器 */
++  def create(acquires: Int = 1): Unit = {
++    require(acquires > 0, "cannot create negative")
++    // containerCount.incrementAndGet()
++    containerCount.tryReleaseSharedWithResult(acquires)
++  }
++
++  /** 删除一个空闲容器 */
++  def remove(acquires: Int = 1): Boolean = {
++    require(acquires > 0, "cannot remove negative or no permits")
++    // sync.nonFairTryAcquireShared(acquires)
++    // 删除一个idle容器，如果是因为请求借用而删除，可能是负值，所以允许设置为负值
++    sync.remove(acquires)
++    // containerCount.addAndGet(-acquires)
++    containerCount.remove(acquires) == 0
++    // containerCount.get() == 0
+   }
+ 
+   /** Returns the number of currently available permits. Possibly negative. */
+-  def availablePermits: Int = sync.permits
++  /** 空闲容器数 **/
++  def idles: Int = sync.permits
+ 
+   //for testing
+-  def counter = operationCount.get()
++  /** Return the count of all containers */
++  // def counter = containerCount.get()
++  /** 容器总数 */
++  def counter = containerCount.permits
+ }
+diff --git a/common/scala/src/main/scala/org/apache/openwhisk/core/connector/Message.scala b/common/scala/src/main/scala/org/apache/openwhisk/core/connector/Message.scala
+index ecb812c3..09e1aeb8 100644
+--- a/common/scala/src/main/scala/org/apache/openwhisk/core/connector/Message.scala
++++ b/common/scala/src/main/scala/org/apache/openwhisk/core/connector/Message.scala
+@@ -67,6 +67,22 @@ case class ActivationMessage(override val transid: TransactionId,
+   def causedBySequence: Boolean = cause.isDefined
+ }
+ 
++/**
++ * Message that is sent from invoker to the controller after warm containers is removed
++ */
++case class ReportMessage(override val transid: TransactionId,
++                             invoker: InvokerInstanceId,
++                             action: FullyQualifiedEntityName,
++                             maxConcurrent: Int,
++                             memoryLimit: Int,
++                             kind: Int)
++    extends Message {
++
++  override def serialize = ReportMessage.serdes.write(this).compactPrint
++
++  override def toString = s"$invoker?action=$action&kind=$kind"
++}
++
+ /**
+  * Message that is sent from the invoker to the controller after action is completed or after slot is free again for
+  * new actions.
+@@ -170,6 +186,14 @@ object ActivationMessage extends DefaultJsonProtocol {
+   implicit val serdes = jsonFormat11(ActivationMessage.apply)
+ }
+ 
++object ReportMessage extends DefaultJsonProtocol {
++
++  def parse(msg: String) = Try(serdes.read(msg.parseJson))
++
++  private implicit val fqnSerdes = FullyQualifiedEntityName.serdes
++  implicit val serdes = jsonFormat6(ReportMessage.apply)
++}
++
+ object CombinedCompletionAndResultMessage extends DefaultJsonProtocol {
+   // this constructor is restricted to ensure the message is always created with certain invariants
+   private def apply(transid: TransactionId,
+diff --git a/core/controller/src/main/scala/org/apache/openwhisk/core/loadBalancer/ShardingContainerPoolBalancer.scala b/core/controller/src/main/scala/org/apache/openwhisk/core/loadBalancer/ShardingContainerPoolBalancer.scala
+index 61bb5e09..2c8b4660 100644
+--- a/core/controller/src/main/scala/org/apache/openwhisk/core/loadBalancer/ShardingContainerPoolBalancer.scala
++++ b/core/controller/src/main/scala/org/apache/openwhisk/core/loadBalancer/ShardingContainerPoolBalancer.scala
+@@ -17,6 +17,8 @@
+ 
+ package org.apache.openwhisk.core.loadBalancer
+ 
++import java.nio.charset.StandardCharsets
++
+ import akka.actor.ActorRef
+ import akka.actor.ActorRefFactory
+ import java.util.concurrent.ThreadLocalRandom
+@@ -40,9 +42,11 @@ import org.apache.openwhisk.core.loadBalancer.InvokerState.{Healthy, Offline, Un
+ import org.apache.openwhisk.core.{ConfigKeys, WhiskConfig}
+ import org.apache.openwhisk.spi.SpiLoader
+ 
++import scala.concurrent.duration._
+ import scala.annotation.tailrec
+ import scala.concurrent.Future
+ import scala.concurrent.duration.FiniteDuration
++import scala.util.{Failure, Success}
+ 
+ /**
+  * A loadbalancer that schedules workload based on a hashing-algorithm.
+@@ -154,6 +158,47 @@ class ShardingContainerPoolBalancer(
+   logging: Logging,
+   materializer: ActorMaterializer)
+     extends CommonLoadBalancer(config, feedFactory, controllerInstance) {
++  /** Initialize message consumers */
++  private val topic = s"removeWarm"
++  private val maxActiveAcksPerPoll = 128
++  private val activeAckPollDuration = 1.second
++  private val removeWarmFeed = actorSystem.actorOf(Props {
++    new MessageFeed(
++      "removeWarm",
++      logging,
++      messagingProvider.getConsumer(
++        config, topic, topic, maxPeek = maxActiveAcksPerPoll),
++      maxActiveAcksPerPoll,
++      activeAckPollDuration,
++      processRemoveWarm)
++  })
++  private val pa = "whisk.system/.*"
++
++  def processRemoveWarm(bytes: Array[Byte]): Future[Unit] = Future {
++    val raw = new String(bytes, StandardCharsets.UTF_8)
++    ReportMessage.parse(raw) match {
++      case Success(p: ReportMessage) =>
++        // logging.error(this, s"#PERSIST# receive report ${p.invoker} ${p.action}, ${p.kind}")
++        if (p.action.asString.matches(pa))
++          logging.error(this, s"#PERSIST# removeWarm a message of system")
++        else if (p.kind == 0)
++        {
++          /** 暂不支持 */
++          // waitWarmInvoker(p.invoker, p.action, p.maxConcurrent, p.memoryLimit)
++          logging.error(this, s"#PERSIST# exit waitWarmInvoker")
++        }
++        else if (p.kind == 1)
++        {
++          removeWarmInvoker(p.invoker, p.action, p.maxConcurrent, p.memoryLimit, 1)
++          // logging.error(this, s"#PERSIST# exit removeWarmInvoker")
++        }
++        removeWarmFeed ! MessageFeed.Processed
++
++      case Failure(t) =>
++        removeWarmFeed ! MessageFeed.Processed
++        logging.error(this, s"failed processing message: $raw with $t")
++    }
++  }
+ 
+   /** Build a cluster of all loadbalancers */
+   private val cluster: Option[Cluster] = if (loadConfigOrThrow[ClusterConfig](ConfigKeys.cluster).useClusterBootstrap) {
+@@ -325,9 +370,27 @@ class ShardingContainerPoolBalancer(
+       Some(monitor))
+ 
+   override protected def releaseInvoker(invoker: InvokerInstanceId, entry: ActivationEntry) = {
++    // val invokerID = invoker.toInt
++    // var action = entry.fullyQualifiedEntityName
++    // var node = schedulingState.invokerSlots(invokerID)
++    // logging.error(this, s"#PERSIST# releaseInvoker invoker:${invoker} action:${action}")
++    // logging.error(this, s"#PERSIST# [before]idles=${node.getIdles(action)}, counter=${node.getCounter(action)}, free=${node.getFree}, total=${node.getTotal}")
+     schedulingState.invokerSlots
+       .lift(invoker.toInt)
+       .foreach(_.releaseConcurrent(entry.fullyQualifiedEntityName, entry.maxConcurrent, entry.memoryLimit.toMB.toInt))
++      // logging.error(this, s"#PERSIST# finish releaseInvoker [after]idles=${node.getIdles(action)}, counter=${node.getCounter(action)}, free=${node.getFree}, total=${node.getTotal}")
++  }
++
++  protected def removeWarmInvoker(invoker: InvokerInstanceId, action: FullyQualifiedEntityName, maxConcurrent: Int, memoryLimit: Int, count: Int) = {
++    // val invokerID = invoker.toInt
++    // var node = schedulingState.invokerSlots(invokerID)
++    // var concurrentState = node.concurrentState
++    // logging.error(this, s"#PERSIST# removeWarmInvoker invoker:${invoker}, action: ${action}, maxConcurrent: ${maxConcurrent}, memoryLimit: ${memoryLimit}, count: ${count}")
++    // logging.error(this, s"#PERSIST# removeWarmInvoker [before]idles=${node.getIdles(action)}, counter=${node.getCounter(action)}, free=${node.getFree}, total=${node.getTotal}")
++    schedulingState.invokerSlots
++      .lift(invoker.toInt)
++      .foreach(_.removeConcurrent(action, maxConcurrent, memoryLimit, count))
++    // logging.error(this, s"#PERSIST# finish removeWarmInvoker [after]idles=${node.getIdles(action)}, counter=${node.getCounter(action)}, free=${node.getFree}, total=${node.getTotal}")
+   }
+ }
+ 
+@@ -404,30 +467,73 @@ object ShardingContainerPoolBalancer extends LoadBalancerProvider {
+     slots: Int,
+     index: Int,
+     step: Int,
+-    stepsDone: Int = 0)(implicit logging: Logging, transId: TransactionId): Option[(InvokerInstanceId, Boolean)] = {
++    stepsDone: Int = 0,
++    maxBusy: Int = -1,
++    maxBusyCount: Int = -1,
++    first: Int = -1)(implicit logging: Logging, transId: TransactionId): Option[(InvokerInstanceId, Boolean)] = {
+     val numInvokers = invokers.size
++    var tmpMaxBusy = maxBusy
++    var tmpMaxBusyCount = maxBusyCount
++    var tmpFirst = first
+ 
+     if (numInvokers > 0) {
+       val invoker = invokers(index)
++      var node = dispatched(invoker.id.toInt)
++      var (hasIdle, hasFree, counter, free, total) = node.tryAcquireConcurrent(fqn, maxConcurrent, slots)
++      // logging.error(this, s"#PERSIST# ${fqn} schedule tryAcquire invoker:${invoker} hasIdle=${hasIdle}, [after]idels=${node.getIdles(fqn)} counter=${counter}, free=${free}, total=${total}")
+       //test this invoker - if this action supports concurrency, use the scheduleConcurrent function
+-      if (invoker.status.isUsable && dispatched(invoker.id.toInt).tryAcquireConcurrent(fqn, maxConcurrent, slots)) {
++      if (invoker.status.isUsable && hasIdle) {
++        /** 获得一个空闲容器 */
++        // logging.error(this, s"#PERSIST# ${fqn} schedule use idle on ${invoker}, [after]idles=${node.getIdles(fqn)}, counter=${node.getCounter(fqn)}, free=${node.getFree}, total=${node.getTotal}")
+         Some(invoker.id, false)
+       } else {
++        /** 找第一个总内存够的节点 */
++        if (total > slots && tmpFirst == -1)
++          tmpFirst = index
++        /** 找空闲内存够，容器总数多的节点 */
++        if (hasFree && counter > tmpMaxBusyCount)
++        {
++          tmpMaxBusy = index
++          tmpMaxBusyCount = counter
++        }
+         // If we've gone through all invokers
+         if (stepsDone == numInvokers + 1) {
+-          val healthyInvokers = invokers.filter(_.status.isUsable)
+-          if (healthyInvokers.nonEmpty) {
+-            // Choose a healthy invoker randomly
+-            val random = healthyInvokers(ThreadLocalRandom.current().nextInt(healthyInvokers.size)).id
+-            dispatched(random.toInt).forceAcquireConcurrent(fqn, maxConcurrent, slots)
+-            logging.warn(this, s"system is overloaded. Chose invoker${random.toInt} by random assignment.")
+-            Some(random, true)
+-          } else {
+-            None
++          if (tmpMaxBusy != -1)
++          {
++            /** 直接用空闲内存创建一个忙容器 */
++            var select = invokers(tmpMaxBusy)
++            var node = dispatched(select.id.toInt)
++            node.forceAcquireConcurrent(fqn, maxConcurrent, slots)
++            // logging.error(this, s"#PERSIST# ${fqn} schedule use busy/cold on ${select}, busy: ${tmpMaxBusyCount} [after]idles=${node.getIdles(fqn)}, counter=${node.getCounter(fqn)}, free=${node.getFree}, total=${node.getTotal}")
++            Some(select.id, false)
++          }
++          else if (first != -1)
++          {
++            /** 驱逐其他容器然后创建一个忙容器 */
++            var select = invokers(tmpFirst)
++            var node = dispatched(select.id.toInt)
++            node.forceAcquireConcurrent(fqn, maxConcurrent, slots)
++            // logging.error(this, s"#PERSIST# ${fqn} schedule use cold with replacement on ${select}, [after]idles=${node.getIdles(fqn)}, counter=${node.getCounter(fqn)}, free=${node.getFree}, total=${node.getTotal}")
++            Some(select.id, false)
++          }
++          else
++          {
++            // logging.error(this, s"#PERSIST# schedule use random when overloaded")
++            val healthyInvokers = invokers.filter(_.status.isUsable)
++            if (healthyInvokers.nonEmpty) {
++              // Choose a healthy invoker randomly
++              /** 系统过载随机选一个节点 */
++              val random = healthyInvokers(ThreadLocalRandom.current().nextInt(healthyInvokers.size)).id
++              dispatched(random.toInt).forceAcquireConcurrent(fqn, maxConcurrent, slots)
++              logging.warn(this, s"system is overloaded. Chose invoker${random.toInt} by random assignment.")
++              Some(random, true)
++            } else {
++              None
++            }
+           }
+         } else {
+           val newIndex = (index + step) % numInvokers
+-          schedule(maxConcurrent, fqn, invokers, dispatched, slots, newIndex, step, stepsDone + 1)
++          schedule(maxConcurrent, fqn, invokers, dispatched, slots, newIndex, step, stepsDone + 1, tmpMaxBusy, tmpMaxBusyCount, tmpFirst)
+         }
+       }
+     } else {
+diff --git a/core/invoker/src/main/resources/application.conf b/core/invoker/src/main/resources/application.conf
+index 0f59dd64..9d729071 100644
+--- a/core/invoker/src/main/resources/application.conf
++++ b/core/invoker/src/main/resources/application.conf
+@@ -123,7 +123,7 @@ whisk {
+     timeouts {
+       # The "unusedTimeout" in the ContainerProxy,
+       #aka 'How long should a container sit idle until we kill it?'
+-      idle-container = 10 minutes
++      idle-container = 1 minutes
+       pause-grace = 50 milliseconds
+     }
+   }
+diff --git a/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/ContainerPool.scala b/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/ContainerPool.scala
+index 1fecfbf9..ffc8c2af 100644
+--- a/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/ContainerPool.scala
++++ b/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/ContainerPool.scala
+@@ -17,16 +17,18 @@
+ 
+ package org.apache.openwhisk.core.containerpool
+ 
+-import akka.actor.{Actor, ActorRef, ActorRefFactory, Props}
++import akka.actor.{Actor, ActorRef, ActorRefFactory, Props, _}
+ import org.apache.openwhisk.common.MetricEmitter
+ import org.apache.openwhisk.common.{AkkaLogging, LoggingMarkers, TransactionId}
+-import org.apache.openwhisk.core.connector.MessageFeed
++import org.apache.openwhisk.core.connector._
+ import org.apache.openwhisk.core.entity._
+ import org.apache.openwhisk.core.entity.size._
+ import scala.annotation.tailrec
+ import scala.collection.immutable
+ import scala.concurrent.duration._
+ import scala.util.Try
++import scala.collection.mutable.ListBuffer
++import scala.util.control.Breaks._
+ 
+ sealed trait WorkerState
+ case object Busy extends WorkerState
+@@ -36,6 +38,12 @@ case class WorkerData(data: ContainerData, state: WorkerState)
+ 
+ case object EmitMetrics
+ 
++case class ActionData(a: FullyQualifiedEntityName, c: Int, m: Int)
++
++case class RemoveData(ref: ActorRef, name: String)
++
++case class PendData(ref: ActorRef, r: Run)
++
+ /**
+  * A pool managing containers to run actions on.
+  *
+@@ -59,7 +67,9 @@ case object EmitMetrics
+ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
+                     feed: ActorRef,
+                     prewarmConfig: List[PrewarmingConfig] = List.empty,
+-                    poolConfig: ContainerPoolConfig)
++                    poolConfig: ContainerPoolConfig,
++                    instance: InvokerInstanceId,
++                    producer: MessageProducer)
+     extends Actor {
+   import ContainerPool.memoryConsumptionOf
+ 
+@@ -77,6 +87,11 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
+   //periodically emit metrics (don't need to do this for each message!)
+   context.system.scheduler.schedule(30.seconds, 10.seconds, self, EmitMetrics)
+ 
++  var actionPool = immutable.Map.empty[String, ActionData]
++
++  /** 记录待绑定的请求 */
++  var pendingBuffer = ListBuffer.empty[PendData]
++
+   prewarmConfig.foreach { config =>
+     logging.info(this, s"pre-warming ${config.count} ${config.exec.kind} ${config.memoryLimit.toString}")(
+       TransactionId.invokerWarmup)
+@@ -105,6 +120,13 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
+     // their requests and send them back to the pool for rescheduling (this may happen if "docker" operations
+     // fail for example, or a container has aged and was destroying itself when a new request was assigned)
+     case r: Run =>
++      actionPool.get(r.action.name.name) match {
++        case None =>
++          // Must use r.msg.action as key, DO NOT build it from namespace and name!!!
++          actionPool = actionPool + (r.action.name.name -> new ActionData(r.msg.action,
++            r.action.limits.concurrency.maxConcurrent, r.action.limits.memory.megabytes.MB.toMB.toInt))
++        case _ =>
++      }
+       // Check if the message is resent from the buffer. Only the first message on the buffer can be resent.
+       val isResentFromBuffer = runBuffer.nonEmpty && runBuffer.dequeueOption.exists(_._1.msg == r.msg)
+ 
+@@ -175,7 +197,14 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
+               runBuffer = newBuffer
+               runBuffer.dequeueOption.foreach { case (run, _) => self ! run }
+             }
+-            actor ! r // forwards the run request to the container
++
++            /** 检查容器冷热情况，热容器执行请求，冷容器则把请求入队，冷容器也变成busy */
++            var bind = (containerState == "warmed")
++            actor ! r.copy(bind = bind, cold = !bind) // forwards the run request to the container
++            if (!bind)
++            {
++              pendingBuffer += PendData(actor, r)
++            }
+             logContainerStart(r, containerState, newData.activeActivationCount, container)
+           case None =>
+             // this can also happen if createContainer fails to start a new container, or
+@@ -212,13 +241,58 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
+ 
+     // Container is free to take more work
+     case NeedWork(warmData: WarmedData) =>
+-      feed ! MessageFeed.Processed
++      /** 假定一个容器收到删除信号时，刚好发出这个信号，那么这个容器实际上是找不到的
++       *  先检查，避免这种情况
++       */
++      if (busyPool.contains(sender()) || freePool.contains(sender()))
++    {
+       val oldData = freePool.get(sender()).getOrElse(busyPool(sender()))
+-      val newData =
++      var newData =
+         warmData.copy(lastUsed = oldData.lastUsed, activeActivationCount = oldData.activeActivationCount - 1)
+       if (newData.activeActivationCount < 0) {
++        /** 之前的请求释放出的未用的容器，原来是0，现在是-1，置为0 */
++        newData = newData.copy(activeActivationCount = 0)
+         logging.error(this, s"invalid activation count after warming < 1 ${newData}")
+       }
++
++      /** 尝试唤醒一个等待绑定的请求进行容器交换，这个容器可能来自/去往任意一个pool，注意更新状态 */
++      if (newData.hasCapacity())
++      {
++        // Try to find a matched request in pendingBuffer
++        var found = false
++        breakable
++        {
++          var index = 0
++          pendingBuffer.foreach {
++            p =>
++              if (p.r.action.name.name == warmData.action.name.name)
++              {
++                // 绑定成功，计数增加，将进入busy pool
++                newData = newData.nextRun(p.r)
++                sender() ! p.r.copy(bind = true, cold = true)
++                pendingBuffer.remove(index)
++                /** 原来的容器应该从busy交换到free pool */
++                var ori = busyPool(p.ref)
++                ori match {
++                  case d: WarmingData =>
++                    ori = d.copy(activeActivationCount = d.activeActivationCount - 1)
++                  case d: WarmingColdData =>
++                    ori = d.copy(activeActivationCount = d.activeActivationCount - 1)
++                  case _ =>
++                    logging.error(this, s"#PERSIST# impossible origin container")
++                }
++                busyPool = busyPool - p.ref
++                freePool = freePool + (p.ref -> ori)
++                found = true
++                // logging.error(this, s"#PERSIST# NEED find a pend, ${oldData} -> ${newData}")
++                break
++              }
++              index += 1
++          }
++        }
++      }
++      feed ! MessageFeed.Processed
++
+       if (newData.hasCapacity()) {
+         //remove from busy pool (may already not be there), put back into free pool (to update activation counts)
+         freePool = freePool + (sender() -> newData)
+@@ -234,13 +308,15 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
+         busyPool = busyPool + (sender() -> newData)
+         freePool = freePool - sender()
+       }
++    }
+ 
+     // Container is prewarmed and ready to take work
+     case NeedWork(data: PreWarmedData) =>
+       prewarmedPool = prewarmedPool + (sender() -> data)
+ 
+     // Container got removed
+-    case ContainerRemoved =>
++    case ContainerRemoved(name: String, reason: String) =>
++      // logging.error(this, s"#PERSIST# ContainerRemoved $name $reason")
+       // if container was in free pool, it may have been processing (but under capacity),
+       // so there is capacity to accept another job request
+       freePool.get(sender()).foreach { f =>
+@@ -254,15 +330,20 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
+         busyPool = busyPool - sender()
+         feed ! MessageFeed.Processed
+       }
++      if (reason == "aged")
++        sendReport(actionPool(name))
+ 
+     // This message is received for one of these reasons:
+     // 1. Container errored while resuming a warm container, could not process the job, and sent the job back
+     // 2. The container aged, is destroying itself, and was assigned a job which it had to send back
+     // 3. The container aged and is destroying itself
+     // Update the free/busy lists but no message is sent to the feed since there is no change in capacity yet
+-    case RescheduleJob =>
++    case RescheduleJob(name: String, reason: String) =>
++      // logging.error(this, s"#PERSIST# RescheduleJob $name $reason")
+       freePool = freePool - sender()
+       busyPool = busyPool - sender()
++      if (reason == "aged")
++        sendReport(actionPool(name))
+     case EmitMetrics =>
+       emitMetrics()
+   }
+@@ -308,10 +389,11 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
+   }
+ 
+   /** Removes a container and updates state accordingly. */
+-  def removeContainer(toDelete: ActorRef) = {
+-    toDelete ! Remove
+-    freePool = freePool - toDelete
+-    busyPool = busyPool - toDelete
++  def removeContainer(toDelete: RemoveData) = {
++    toDelete.ref ! Remove
++    freePool = freePool - toDelete.ref
++    busyPool = busyPool - toDelete.ref
++    sendReport(actionPool(toDelete.name))
+   }
+ 
+   /**
+@@ -343,6 +425,11 @@ class ContainerPool(childFactory: ActorRefFactory => ActorRef,
+       LoggingMarkers.CONTAINER_POOL_PREWARM_SIZE,
+       prewarmedPool.map(_._2.memoryLimit.toMB).sum)
+   }
++
++  def sendReport(d: ActionData) = {
++    logging.error(this, s"#PERSIST# sendReport ${d.a}, ${d.c}, ${d.m}")
++    producer.send("removeWarm", ReportMessage(TransactionId.unknown, instance, d.a, d.c, d.m, 1))
++  }
+ }
+ 
+ object ContainerPool {
+@@ -377,7 +464,7 @@ object ContainerPool {
+                                            idles: Map[A, ContainerData]): Option[(A, ContainerData)] = {
+     idles
+       .find {
+-        case (_, c @ WarmedData(_, `invocationNamespace`, `action`, _, _)) if c.hasCapacity() => true
++        case (_, c @ WarmedData(_, `invocationNamespace`, `action`, _, _, _)) if c.hasCapacity() => true
+         case _                                                                                => false
+       }
+       .orElse {
+@@ -406,9 +493,9 @@ object ContainerPool {
+    * @return a list of containers to be removed iff found
+    */
+   @tailrec
+-  protected[containerpool] def remove[A](pool: Map[A, ContainerData],
++  protected[containerpool] def remove[A](pool: Map[ActorRef, ContainerData],
+                                          memory: ByteSize,
+-                                         toRemove: List[A] = List.empty): List[A] = {
++                                         toRemove: List[RemoveData] = List.empty): List[RemoveData] = {
+     // Try to find a Free container that does NOT have any active activations AND is initialized with any OTHER action
+     val freeContainers = pool.collect {
+       // Only warm containers will be removed. Prewarmed containers will stay always.
+@@ -424,7 +511,7 @@ object ContainerPool {
+       val (ref, data) = freeContainers.minBy(_._2.lastUsed)
+       // Catch exception if remaining memory will be negative
+       val remainingMemory = Try(memory - data.memoryLimit).getOrElse(0.B)
+-      remove(freeContainers - ref, remainingMemory, toRemove ++ List(ref))
++      remove(freeContainers - ref, remainingMemory, toRemove ++ List(RemoveData(ref, data.action.name.name)))
+     } else {
+       // If this is the first call: All containers are in use currently, or there is more memory needed than
+       // containers can be removed.
+@@ -437,8 +524,10 @@ object ContainerPool {
+   def props(factory: ActorRefFactory => ActorRef,
+             poolConfig: ContainerPoolConfig,
+             feed: ActorRef,
+-            prewarmConfig: List[PrewarmingConfig] = List.empty) =
+-    Props(new ContainerPool(factory, feed, prewarmConfig, poolConfig))
++            prewarmConfig: List[PrewarmingConfig] = List.empty,
++            instance: InvokerInstanceId,
++            producer: MessageProducer) =
++    Props(new ContainerPool(factory, feed, prewarmConfig, poolConfig, instance, producer))
+ }
+ 
+ /** Contains settings needed to perform container prewarming. */
+diff --git a/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/ContainerProxy.scala b/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/ContainerProxy.scala
+index 924a5f74..43515125 100644
+--- a/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/ContainerProxy.scala
++++ b/core/invoker/src/main/scala/org/apache/openwhisk/core/containerpool/ContainerProxy.scala
+@@ -165,7 +165,8 @@ case class WarmedData(override val container: Container,
+                       invocationNamespace: EntityName,
+                       action: ExecutableWhiskAction,
+                       override val lastUsed: Instant,
+-                      override val activeActivationCount: Int = 0)
++                      override val activeActivationCount: Int = 0,
++                      initInterval: Interval)
+     extends ContainerStarted(container, lastUsed, action.limits.memory.megabytes.MB, activeActivationCount)
+     with ContainerInUse {
+   override val initingState = "warmed"
+@@ -174,14 +175,15 @@ case class WarmedData(override val container: Container,
+ 
+ // Events received by the actor
+ case class Start(exec: CodeExec[_], memoryLimit: ByteSize)
+-case class Run(action: ExecutableWhiskAction, msg: ActivationMessage, retryLogDeadline: Option[Deadline] = None)
++/** bind - 请求/伪请求, cold - 冷启动/热启动 */
++case class Run(action: ExecutableWhiskAction, msg: ActivationMessage, retryLogDeadline: Option[Deadline] = None, bind: Boolean = true, cold: Boolean = true)
+ case object Remove
+ 
+ // Events sent by the actor
+ case class NeedWork(data: ContainerData)
+ case object ContainerPaused
+-case object ContainerRemoved // when container is destroyed
+-case object RescheduleJob // job is sent back to parent and could not be processed because container is being destroyed
++case class ContainerRemoved(name: String = "", reason: String = "error") // when container is destroyed
++case class RescheduleJob(name: String = "", reason: String = "errror") // job is sent back to parent and could not be processed because container is being destroyed
+ case class PreWarmCompleted(data: PreWarmedData)
+ case class InitCompleted(data: WarmedData)
+ case object RunCompleted
+@@ -247,6 +249,11 @@ class ContainerProxy(factory: (TransactionId,
+   var activeCount = 0;
+   startWith(Uninitialized, NoData())
+ 
++  /** 记录action的名字，在删除的时候方便使用 */
++  var name = ""
++  /** 标记冷启动，仅有第一个请求是冷启动 */
++  var cold = true
++
+   when(Uninitialized) {
+     // pre warm a container (creates a stem cell container)
+     case Event(job: Start, _) =>
+@@ -267,6 +274,7 @@ class ContainerProxy(factory: (TransactionId,
+     case Event(job: Run, _) =>
+       implicit val transid = job.msg.transid
+       activeCount += 1
++      name = job.action.name.name
+       // create a new container
+       val container = factory(
+         job.msg.transid,
+@@ -313,8 +321,18 @@ class ContainerProxy(factory: (TransactionId,
+         }
+         .flatMap { container =>
+           // now attempt to inject the user code and run the action
+-          initializeAndRun(container, job)
+-            .map(_ => RunCompleted)
++          /** 创建新容器处理请求，伪请求仅初始化 */
++          if (job.bind)
++          {
++            // now attempt to inject the user code and run the action
++            initializeAndRun(container, job)
++              .map(_ => RunCompleted)
++          }
++          else
++          {
++            initializeWithoutRun(container, job)
++              .map(_ => RunCompleted)
++          }
+         }
+         .pipeTo(self)
+ 
+@@ -339,11 +357,22 @@ class ContainerProxy(factory: (TransactionId,
+     case Event(job: Run, data: PreWarmedData) =>
+       implicit val transid = job.msg.transid
+       activeCount += 1
+-      initializeAndRun(data.container, job)
+-        .map(_ => RunCompleted)
+-        .pipeTo(self)
++      name = job.action.name.name
++      /** 使用一个prewarm处理请求，伪请求仅初始化 */
++      if (job.bind)
++      {
++        // now attempt to inject the user code and run the action
++        initializeAndRun(data.container, job)
++          .map(_ => RunCompleted)
++      }
++      else
++      {
++        initializeWithoutRun(data.container, job)
++          .map(_ => RunCompleted)
++      }
+       goto(Running) using PreWarmedData(data.container, data.kind, data.memoryLimit, 1)
+ 
++    /** 不太可能删除一个prewarm容器，即使删除了，因为没有被使用，可以等同于一个error */
+     case Event(Remove, data: PreWarmedData) => destroyContainer(data.container)
+   }
+ 
+@@ -372,13 +401,14 @@ class ContainerProxy(factory: (TransactionId,
+       } else {
+         goto(Ready) using data
+       }
++    /** Running应该不能接受请求/伪请求 */
+     case Event(job: Run, data: WarmedData)
+-        if activeCount >= data.action.limits.concurrency.maxConcurrent && !rescheduleJob => //if we are over concurrency limit, and not a failure on resume
++        if activeCount >= data.action.limits.concurrency.maxConcurrent && !rescheduleJob && job.bind => //if we are over concurrency limit, and not a failure on resume
+       logging.warn(this, s"buffering for container ${data.container}; ${activeCount} activations in flight")
+       runBuffer = runBuffer.enqueue(job)
+       stay()
+     case Event(job: Run, data: WarmedData)
+-        if activeCount < data.action.limits.concurrency.maxConcurrent && !rescheduleJob => //if there was a delay, and not a failure on resume, skip the run
++        if activeCount < data.action.limits.concurrency.maxConcurrent && !rescheduleJob && job.bind => //if there was a delay, and not a failure on resume, skip the run
+       activeCount += 1
+       implicit val transid = job.msg.transid
+ 
+@@ -387,6 +417,18 @@ class ContainerProxy(factory: (TransactionId,
+         .pipeTo(self)
+       stay() using data
+ 
++    /** Running应该不能接受请求/伪请求
++     *  收到请求时，可能容器还是prewarm状态，此时也应该将请求入队，这是针对旧方案的措施
++     *  收到伪请求，直接忽略
++     */
++    case Event(job: Run, _) =>
++      if (job.bind)
++      {
++        // logging.error(this, s"#PERSIST# Enqueue unbind PREWARMED container ${self} ${job}")
++        runBuffer = runBuffer.enqueue(job)
++      }
++      stay()
++
+     // Failed after /init (the first run failed)
+     case Event(_: FailureMessage, data: PreWarmedData) =>
+       activeCount -= 1
+@@ -404,6 +446,16 @@ class ContainerProxy(factory: (TransactionId,
+       rejectBuffered()
+       stop()
+ 
++    /** 正在初始化的容器，如果请求被交换出去了，也可能被回收 */
++    case Event(Remove, data: PreWarmedData) => destroyContainer(data.container, name, "reclaimed")
++
++    /** 这个情况会出现吗？初始化完成，然后收到删除信号？按理说应该立即发送一个容器可用的信号
++     *  会不会出现刚发出可用，同时收到一个删除信号？结果已经被删除的容器被请求使用
++     * 应该是有可能的，所以在上一级需要检查容器还在不在
++     */
++    case Event(Remove, data: WarmedData) => destroyContainer(data.container, data.action.name.name, "reclaimed")
++
++
+     case _ => delay
+   }
+ 
+@@ -423,7 +475,8 @@ class ContainerProxy(factory: (TransactionId,
+       data.container.suspend()(TransactionId.invokerNanny).map(_ => ContainerPaused).pipeTo(self)
+       goto(Pausing)
+ 
+-    case Event(Remove, data: WarmedData) => destroyContainer(data.container)
++    /** 第二个参数也可以直接用name */
++    case Event(Remove, data: WarmedData) => destroyContainer(data.container, data.action.name.name, "reclaimed")
+   }
+ 
+   when(Pausing) {
+@@ -454,9 +507,13 @@ class ContainerProxy(factory: (TransactionId,
+       goto(Running) using data
+ 
+     // container is reclaimed by the pool or it has become too old
+-    case Event(StateTimeout | Remove, data: WarmedData) =>
++    case Event(StateTimeout, data: WarmedData) =>
+       rescheduleJob = true // to supress sending message to the pool and not double count
+-      destroyContainer(data.container)
++      destroyContainer(data.container, data.action.name.name, "aged")
++
++    case Event(Remove, data: WarmedData) =>
++      rescheduleJob = true // to supress sending message to the pool and not double count
++      destroyContainer(data.container, data.action.name.name, "reclaimed")
+   }
+ 
+   when(Removing) {
+@@ -464,7 +521,7 @@ class ContainerProxy(factory: (TransactionId,
+       // Send the job back to the pool to be rescheduled
+       context.parent ! job
+       stay
+-    case Event(ContainerRemoved, _)  => stop()
++    case Event(ContainerRemoved(_, _), _)  => stop()
+     case Event(_: FailureMessage, _) => stop()
+   }
+ 
+@@ -508,11 +565,12 @@ class ContainerProxy(factory: (TransactionId,
+    *
+    * @param container the container to destroy
+    */
+-  def destroyContainer(container: Container) = {
++  def destroyContainer(container: Container, name: String = "", reason: String = "error") = {
++    // logging.error(this, s"#PERSIST# destroyContainer $container, $name, $reason")
+     if (!rescheduleJob) {
+-      context.parent ! ContainerRemoved
++      context.parent ! ContainerRemoved(name, reason)
+     } else {
+-      context.parent ! RescheduleJob
++      context.parent ! RescheduleJob(name, reason)
+     }
+ 
+     rejectBuffered()
+@@ -542,6 +600,51 @@ class ContainerProxy(factory: (TransactionId,
+     }
+   }
+ 
++  def initializeWithoutRun(container: Container, job: Run)(implicit tid: TransactionId): Future[Option[Interval]] = {
++    val actionTimeout = job.action.limits.timeout.duration
++    val (env, parameters) = ContainerProxy.partitionArguments(job.msg.content, job.msg.initArgs)
++
++    val environment = Map(
++      "namespace" -> job.msg.user.namespace.name.toJson,
++      "action_name" -> job.msg.action.qualifiedNameWithLeadingSlash.toJson,
++      "action_version" -> job.msg.action.version.toJson,
++      "activation_id" -> job.msg.activationId.toString.toJson,
++      "transaction_id" -> job.msg.transid.id.toJson)
++
++    // logging.error(this, s"#PERSIST# initializeWithoutRun ${container}")
++
++    // if the action requests the api key to be injected into the action context, add it here;
++    // treat a missing annotation as requesting the api key for backward compatibility
++    val authEnvironment = {
++      if (job.action.annotations.isTruthy(Annotations.ProvideApiKeyAnnotationName, valueForNonExistent = true)) {
++        job.msg.user.authkey.toEnvironment.fields
++      } else Map.empty
++    }
++
++    // Only initialize iff we haven't yet warmed the container
++    stateData match {
++      case data: WarmedData =>
++        Future.successful(None)
++      case _ =>
++        val owEnv = (authEnvironment ++ environment + ("deadline" -> (Instant.now.toEpochMilli + actionTimeout.toMillis).toString.toJson)) map {
++          case (key, value) => "__OW_" + key.toUpperCase -> value
++        }
++
++        container
++          .initialize(
++            job.action.containerInitializer(env ++ owEnv),
++            actionTimeout,
++            job.action.limits.concurrency.maxConcurrent)
++          .map {initInterval =>
++            var interval = Some(initInterval)
++            if (interval.isDefined)
++              self ! InitCompleted(WarmedData(container, job.msg.user.namespace.name, job.action, Instant.now, 1, initInterval))
++            interval
++          }
++    }
++  }
++
++
+   /**
+    * Runs the job, initialize first if necessary.
+    * Completes the job by:
+@@ -577,7 +680,18 @@ class ContainerProxy(factory: (TransactionId,
+     // Only initialize iff we haven't yet warmed the container
+     val initialize = stateData match {
+       case data: WarmedData =>
+-        Future.successful(None)
++        if (cold && job.cold)
++        {
++          cold = false
++          Future.successful(Some(data.initInterval))
++        }
++        else
++        {
++          if (cold)
++            cold = false
++          Future.successful(None)
++        }
++
+       case _ =>
+         val owEnv = (authEnvironment ++ environment + ("deadline" -> (Instant.now.toEpochMilli + actionTimeout.toMillis).toString.toJson)) map {
+           case (key, value) => "__OW_" + key.toUpperCase -> value
+@@ -595,7 +709,7 @@ class ContainerProxy(factory: (TransactionId,
+       .flatMap { initInterval =>
+         //immediately setup warmedData for use (before first execution) so that concurrent actions can use it asap
+         if (initInterval.isDefined) {
+-          self ! InitCompleted(WarmedData(container, job.msg.user.namespace.name, job.action, Instant.now, 1))
++          self ! InitCompleted(WarmedData(container, job.msg.user.namespace.name, job.action, Instant.now, 1, initInterval.get))
+         }
+ 
+         val env = authEnvironment ++ environment ++ Map(
+diff --git a/core/invoker/src/main/scala/org/apache/openwhisk/core/invoker/InvokerReactive.scala b/core/invoker/src/main/scala/org/apache/openwhisk/core/invoker/InvokerReactive.scala
+index a245c844..b5e3addc 100644
+--- a/core/invoker/src/main/scala/org/apache/openwhisk/core/invoker/InvokerReactive.scala
++++ b/core/invoker/src/main/scala/org/apache/openwhisk/core/invoker/InvokerReactive.scala
+@@ -208,7 +208,7 @@ class InvokerReactive(
+   }
+ 
+   private val pool =
+-    actorSystem.actorOf(ContainerPool.props(childFactory, poolConfig, activationFeed, prewarmingConfigs))
++    actorSystem.actorOf(ContainerPool.props(childFactory, poolConfig, activationFeed, prewarmingConfigs, instance, producer))
+ 
+   /** Is called when an ActivationMessage is read from Kafka */
+   def processActivationMessage(bytes: Array[Byte]): Future[Unit] = {
